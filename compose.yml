@@ -17,7 +17,7 @@ x-pg: &pg
 
 x-app: &app
   # one shared image; it is built once (by bank-a1) and reused by the other services
-  image: ${DOCKERHUB_USER:-matinghanbari}/ds-a2-bank:latest
+  image: ${DOCKERHUB_USER:-132461342342351345234}/ds-a2-bank:latest
   pull_policy: never
   healthcheck:
     test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2)"]
