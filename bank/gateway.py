@@ -6,6 +6,7 @@ Cross-shard transfers are handed to the Coordinator (2PC). Every routed request 
 logged as  ROUTE op=... acct=... shard=... replica=...  (used by the experiments).
 """
 import os
+import time
 import uuid
 from contextlib import asynccontextmanager
 
@@ -20,6 +21,8 @@ log = setup_logging("gateway")
 router = Router(os.environ["META_DSN"], log)
 COORDINATOR = os.environ.get("COORDINATOR_URL", "http://coordinator:8000")
 coord = httpx.Client(timeout=httpx.Timeout(30.0, connect=2.0))
+# How long a request may wait while its range is fenced for a re-sharding cutover.
+FENCE_WAIT = float(os.environ.get("FENCE_WAIT", "20"))
 
 
 @asynccontextmanager
@@ -37,18 +40,28 @@ async def _bank_error(_req, e: BankError):
     return JSONResponse(status_code=e.status, content=e.body())
 
 
-def forward(op, acct, method, path, payload=None):
-    """Route to the owning shard; on a fencing/epoch rejection (421) refresh the map once."""
-    for attempt in (1, 2):
+def forward(op, acct, method, path, payload=None, epoch_accts=()):
+    """Route to the owning shard. A 421 (WRONG_SHARD / STALE_EPOCH / FENCED) means our Shard
+    Map is stale or a cutover is in progress: nothing was applied, so refresh the map and
+    retry (bounded by FENCE_WAIT) - this is the brief pause of a migrating range."""
+    deadline, logged = time.monotonic() + FENCE_WAIT, False
+    while True:
         shard, epoch = router.shard_for(acct)
+        for a in epoch_accts:  # local transfer: send the highest epoch of the ranges involved
+            epoch = max(epoch, router.shard_for(a)[1])
         if payload is not None:
             replica, resp = router.call(shard, method, path, json={**payload, "epoch": epoch})
         else:
             replica, resp = router.call(shard, method, path, params={"epoch": epoch})
-        if resp.status_code == 421 and attempt == 1:
-            log.info("ROUTE op=%s acct=%s rejected by %s (%s) -> refreshing shard map",
-                     op, acct, replica.id, resp.json().get("error"))
+        if resp.status_code == 421 and time.monotonic() < deadline:
+            if not logged:
+                log.info("ROUTE op=%s acct=%s rejected by %s (%s) -> refresh shard map + retry",
+                         op, acct, replica.id, resp.json().get("error"))
+                logged = True
+            time.sleep(0.3)
             router.refresh()
+            if op == "transfer" and payload and router.shard_for(payload["from"])[0] != router.shard_for(payload["to"])[0]:
+                return None  # ownership changed under us: the caller re-decides local vs 2PC
             continue
         break
     body = resp.json()
@@ -100,7 +113,10 @@ def transfer(body: dict = Body(...)):
     (s1, _), (s2, _) = router.shard_for(p["from"]), router.shard_for(p["to"])
     if s1 == s2:
         # same shard => one local ACID transaction on that shard, no coordinator needed
-        return forward("transfer", p["from"], "POST", "/transfer_local", p)
+        r = forward("transfer", p["from"], "POST", "/transfer_local", p, epoch_accts=(p["to"],))
+        if r is not None:
+            return r
+        (s1, _), (s2, _) = router.shard_for(p["from"]), router.shard_for(p["to"])
     try:
         resp = coord.post(COORDINATOR + "/transfer", json=p)
         b = resp.json()

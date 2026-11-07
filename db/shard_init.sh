@@ -1,6 +1,7 @@
 #!/bin/bash
 # Shard database init (runs once, by the postgres image entrypoint).
 # Env: SHARD_ID, RANGE_LO, RANGE_HI  -> only this shard's accounts are created here.
+#      SEED=0 (Shard C): schema only; accounts + ownership arrive via live migration.
 set -euo pipefail
 psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" <<SQL
 CREATE TABLE accounts (
@@ -24,6 +25,7 @@ CREATE TABLE ownership (
 CREATE TABLE applied_requests (
     request_id   text PRIMARY KEY,
     op           text NOT NULL,
+    accounts     text[] NOT NULL DEFAULT '{}',   -- accounts touched (copied on re-sharding)
     http_status  int,
     response     jsonb,
     created_at   timestamptz NOT NULL DEFAULT now()
@@ -52,10 +54,21 @@ CREATE TABLE ledger (
     at           timestamptz NOT NULL DEFAULT now()
 );
 
+-- Bonus I: durable migration checkpoint on the TARGET, updated in the same transaction
+-- as the copied/replayed rows (=> checkpoint and data can never disagree).
+CREATE TABLE migration_progress (
+    migration_id   text PRIMARY KEY,
+    snapshot_next  int,                 -- next account number to copy in the snapshot
+    cdc_lsn        pg_lsn               -- commit LSN of the last replayed source transaction
+);
+SQL
+if [[ "${SEED:-1}" == "1" ]]; then
+psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" <<SQL
 INSERT INTO accounts (id, num, balance_cents)
 SELECT 'A' || lpad(n::text, 4, '0'), n, 100000          -- 1000.00 each
 FROM generate_series(${RANGE_LO}, ${RANGE_HI}) AS n;
 
 INSERT INTO ownership VALUES (${RANGE_LO}, ${RANGE_HI}, 1, true);
 SQL
-echo "shard ${SHARD_ID}: seeded accounts ${RANGE_LO}..${RANGE_HI}"
+fi
+echo "shard ${SHARD_ID}: initialised (seed=${SEED:-1})"

@@ -45,6 +45,23 @@ CREATE TABLE txns (
 );
 CREATE INDEX txns_unresolved ON txns (created_at) WHERE state <> 'COMPLETED';
 
+-- Bonus I: persisted re-sharding state machine (one row per migration).
+CREATE TABLE migrations (
+    id             text PRIMARY KEY,
+    range_lo       int NOT NULL,
+    range_hi       int NOT NULL,
+    source_shard   text NOT NULL,
+    target_shard   text NOT NULL,
+    new_epoch      bigint NOT NULL,
+    phase          text NOT NULL,       -- PLANNED SPLIT SNAPSHOT CATCHUP FENCING CUTOVER_DECIDED ACTIVATED DONE
+    slot           text NOT NULL,       -- logical replication slot on the source (CDC)
+    snapshot_next  int,                 -- mirror of the target checkpoint (display)
+    cdc_lsn        text,                -- mirror of the target checkpoint (display)
+    cutover        jsonb,               -- verified counts/checksum + epoch = the cutover decision
+    history        jsonb NOT NULL DEFAULT '[]',
+    updated_at     timestamptz NOT NULL DEFAULT now()
+);
+
 INSERT INTO map_epoch VALUES (1, 1);
 INSERT INTO shard_ranges VALUES (1, 1000, 'A', 1), (1001, 2000, 'B', 1);
 INSERT INTO replicas VALUES

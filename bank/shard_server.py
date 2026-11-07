@@ -88,14 +88,14 @@ def change(cur, acct, delta, kind, rid=None, txn_id=None) -> int:
     return new
 
 
-def idempotent(rid: str, op: str, work):
+def idempotent(rid: str, op: str, accounts: list, work):
     """Run `work(cur)` once per request id, atomically with recording its result."""
     with pool.connection() as conn:
         with conn.transaction():
             cur = conn.cursor()
             # A concurrent duplicate blocks here until the first one commits.
-            cur.execute("INSERT INTO applied_requests (request_id, op) VALUES (%s, %s) "
-                        "ON CONFLICT DO NOTHING", (rid, op))
+            cur.execute("INSERT INTO applied_requests (request_id, op, accounts) VALUES (%s, %s, %s) "
+                        "ON CONFLICT DO NOTHING", (rid, op, accounts))
             if cur.rowcount == 0:
                 cur.execute("SELECT http_status, response FROM applied_requests WHERE request_id = %s", (rid,))
                 status, stored = cur.fetchone()
@@ -150,7 +150,7 @@ def deposit(body: dict = Body(...)):
         new = change(cur, acct, cents, "deposit", rid)
         log.info("DEPOSIT %s +%s -> %s rid=%s", acct, fmt(cents), fmt(new), rid)
         return {"account": acct, "balance": fmt(new)}
-    return idempotent(rid, "deposit", work)
+    return idempotent(rid, "deposit", [acct], work)
 
 
 @app.post("/withdraw")
@@ -169,7 +169,7 @@ def withdraw(body: dict = Body(...)):
         new = change(cur, acct, -cents, "withdraw", rid)
         log.info("WITHDRAW %s -%s -> %s rid=%s", acct, fmt(cents), fmt(new), rid)
         return {"account": acct, "balance": fmt(new)}
-    return idempotent(rid, "withdraw", work)
+    return idempotent(rid, "withdraw", [acct], work)
 
 
 @app.post("/transfer_local")
@@ -196,7 +196,7 @@ def transfer_local(body: dict = Body(...)):
         log.info("TRANSFER(local) %s -> %s %s  [%s=%s, %s=%s] rid=%s",
                  src, dst, fmt(cents), src, fmt(b1), dst, fmt(b2), rid)
         return {"from": src, "to": dst, "amount": fmt(cents), "from_balance": fmt(b1), "to_balance": fmt(b2)}
-    return idempotent(rid, "transfer", work)
+    return idempotent(rid, "transfer", [src, dst], work)
 
 
 # ---------------------------------------------------------------- 2PC participant
@@ -231,6 +231,11 @@ def prepare(body: dict = Body(...)):
             cur.execute("BEGIN")
             cur.execute("SET LOCAL lock_timeout = '5s'")
             check_owner(cur, num, epoch, lock=True)
+            rid = body.get("request_id")
+            if rid:  # e.g. a same-shard transfer applied before re-sharding, retried as 2PC after
+                cur.execute("SELECT 1 FROM applied_requests WHERE request_id = %s", (rid,))
+                if cur.fetchone():
+                    raise BankError("DUPLICATE_REQUEST", 409, "request id already applied on this shard")
             bal, frozen = lock_account(cur, acct)
             if frozen:
                 raise BankError("ACCOUNT_FROZEN", 409, f"account {acct} is frozen")

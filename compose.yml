@@ -4,7 +4,8 @@ name: dsbank
 
 x-pg: &pg
   image: postgres:16
-  command: ["postgres", "-c", "max_prepared_transactions=100", "-c", "max_connections=200"]
+  command: ["postgres", "-c", "max_prepared_transactions=100", "-c", "max_connections=200",
+            "-c", "wal_level=logical", "-c", "max_replication_slots=10"]   # logical: CDC for re-sharding
   healthcheck:
     # -h 127.0.0.1: the init-time temp server only listens on the unix socket
     test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U bank"]
@@ -69,6 +70,51 @@ services:
     environment: {REPLICA_ID: bank-b2, SHARD_ID: B, DB_DSN: "postgresql://bank:bank@db-b:5432/bank"}
     depends_on: {db-b: {condition: service_healthy}}
 
+  # ---------------- Bonus I: Shard C, started at runtime:  docker compose --profile shardc up -d
+  db-c:               # Shard C database: empty; receives A1501-A2000 by live migration
+    <<: *pg
+    profiles: [shardc]
+    environment: {POSTGRES_USER: bank, POSTGRES_PASSWORD: bank, POSTGRES_DB: bank,
+                  SHARD_ID: C, RANGE_LO: "0", RANGE_HI: "0", SEED: "0"}
+    volumes:
+      - db-c-data:/var/lib/postgresql/data
+      - ./db/shard_init.sh:/docker-entrypoint-initdb.d/01-shard.sh:ro
+  bank-c1:
+    <<: *bank
+    profiles: [shardc]
+    environment: {REPLICA_ID: bank-c1, SHARD_ID: C, DB_DSN: "postgresql://bank:bank@db-c:5432/bank"}
+    depends_on: {db-c: {condition: service_healthy}}
+  bank-c2:
+    <<: *bank
+    profiles: [shardc]
+    environment: {REPLICA_ID: bank-c2, SHARD_ID: C, DB_DSN: "postgresql://bank:bank@db-c:5432/bank"}
+    depends_on: {db-c: {condition: service_healthy}}
+  migrator:           # live re-sharding controller (crash-consistent state machine in meta-db)
+    <<: *app
+    profiles: [shardc]
+    command: ["python", "-m", "bank.migrator"]
+    healthcheck: {disable: true}
+    environment:
+      META_DSN: "postgresql://bank:bank@meta-db:5432/meta"
+      SOURCE_DSN: "postgresql://bank:bank@db-b:5432/bank"
+      TARGET_DSN: "postgresql://bank:bank@db-c:5432/bank"
+      MIGRATION_ID: m1
+      SOURCE_SHARD: B
+      TARGET_SHARD: C
+      RANGE_LO: "1501"
+      RANGE_HI: "2000"
+      TARGET_REPLICAS: "bank-c1=http://bank-c1:8000,bank-c2=http://bank-c2:8000"
+      # demo pacing (so each phase is visible and can be killed); 0 for full speed
+      SNAPSHOT_BATCH: "20"
+      SNAPSHOT_SLEEP: "0.25"
+      CATCHUP_MIN: "6"
+      FENCE_HOLD: "2"
+      CLEANUP_DELAY: "4"
+    depends_on:
+      meta-db: {condition: service_healthy}
+      db-b: {condition: service_healthy}
+      db-c: {condition: service_healthy}
+
   coordinator:        # 2PC coordinator (own container so it can be stopped alone)
     <<: *app
     command: ["uvicorn", "bank.coordinator:app", "--host", "0.0.0.0", "--port", "8000", "--no-access-log"]
@@ -97,3 +143,4 @@ volumes:
   meta-data:
   db-a-data:
   db-b-data:
+  db-c-data:

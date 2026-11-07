@@ -41,6 +41,8 @@ router = Router(META_DSN, log, request_timeout=10.0)
 PHASE2_WAIT = float(os.environ.get("PHASE2_WAIT", "6"))         # how long a client request waits for acks
 RECOVERY_INTERVAL = float(os.environ.get("RECOVERY_INTERVAL", "1.5"))
 FAULT = {"mode": os.environ.get("FAULT_MODE") or None}
+REROUTE_WAIT = float(os.environ.get("REROUTE_WAIT", "20"))  # max wait for a re-sharding cutover
+ROUTING_ERRORS = {"STALE_EPOCH", "FENCED", "WRONG_SHARD"}
 FAULT_MODES = {None, "after_prepared", "after_decision", "after_first_ack"}
 
 active, active_lock = set(), threading.Lock()   # txns currently driven by this process
@@ -111,18 +113,27 @@ def run_2pc(txn_id):
     votes, all_yes, reason = {}, True, None
     # Participants are prepared sequentially in shard order => locks are always taken in
     # the same global order (shard A row before shard B row) => no distributed deadlock.
-    for p in sorted(t["participants"], key=lambda p: p["shard"]):
-        try:
-            replica, resp = router.call(p["shard"], "POST", "/2pc/prepare",
-                                        json={"txn_id": str(txn_id), "account": p["account"],
-                                              "delta": p["delta"], "epoch": p["epoch"]})
-            b = resp.json()
-            vote = b.get("vote") if resp.status_code == 200 else "NO"
-            why = b.get("reason") or b.get("error")
-            votes[p["shard"]] = {"vote": vote, "reason": why, "replica": replica.id}
-        except Exception as e:  # unreachable shard / timeout => NO
-            vote, why = "NO", f"{type(e).__name__}: {getattr(e, 'message', e)}"
-            votes[p["shard"]] = {"vote": "NO", "reason": why}
+    parts = sorted(t["participants"], key=lambda p: p["shard"])
+    for p in parts:
+        deadline = time.monotonic() + REROUTE_WAIT
+        while True:
+            vote, why, rep = prepare_one(txn_id, t["request_id"], p)
+            if vote == "YES" or why not in ROUTING_ERRORS or time.monotonic() > deadline:
+                break
+            # The participant's range is fenced / moved (live re-sharding). Nothing was
+            # prepared there, so wait for the new Shard Map and re-route this participant.
+            # The new participant list is made durable BEFORE preparing on the new owner.
+            time.sleep(0.3)
+            router.refresh()
+            shard, epoch = router.shard_for(p["account"])
+            if (shard, epoch) != (p["shard"], p["epoch"]):
+                log.info("TXN %s participant %s moved %s(e%s) -> %s(e%s), re-routing", str(txn_id)[:8],
+                         p["account"], p["shard"], p["epoch"], shard, epoch)
+                p.update(shard=shard, epoch=epoch)
+                with pool.connection() as c:
+                    c.execute("UPDATE txns SET participants = %s, updated_at = now() WHERE txn_id = %s",
+                              (Jsonb(parts), txn_id))
+        votes[p["shard"]] = {"vote": vote, "reason": why, "replica": rep}
         log.info("TXN %s PREPARE shard %s (%s %s) -> %s %s", str(txn_id)[:8], p["shard"], p["account"],
                  fmt(p["delta"]), vote, f"({why})" if vote != "YES" else "")
         if vote != "YES":
@@ -136,6 +147,18 @@ def run_2pc(txn_id):
         return finish(txn_id, "COMMIT", PHASE2_WAIT)
     set_state(txn_id, "ABORT_DECIDED", votes=votes, reason=reason)
     return finish(txn_id, "ABORT", PHASE2_WAIT)
+
+
+def prepare_one(txn_id, request_id, p):
+    try:
+        replica, resp = router.call(p["shard"], "POST", "/2pc/prepare",
+                                    json={"txn_id": str(txn_id), "account": p["account"], "delta": p["delta"],
+                                          "epoch": p["epoch"], "request_id": request_id})
+        b = resp.json()
+        vote = b.get("vote") if resp.status_code == 200 else "NO"
+        return vote, b.get("reason") or b.get("error"), replica.id
+    except Exception as e:  # unreachable shard / timeout => NO
+        return "NO", f"{type(e).__name__}: {getattr(e, 'message', e)}", None
 
 
 def finish(txn_id, decision, wait):
@@ -239,6 +262,9 @@ def transfer(body: dict = Body(...)):
     rid = require_request_id(body.get("request_id"))
     src, dst, cents = body.get("from"), body.get("to"), parse_amount(body.get("amount"))
     (s1, e1), (s2, e2) = router.shard_for(src), router.shard_for(dst)
+    if s1 == s2:  # our cached Shard Map may be older than the gateway's (re-sharding) -> re-read
+        router.refresh()
+        (s1, e1), (s2, e2) = router.shard_for(src), router.shard_for(dst)
     if s1 == s2:
         raise BankError("BAD_REQUEST", 400, "same-shard transfer does not need 2PC")
     participants = [{"shard": s1, "account": src, "delta": -cents, "epoch": e1},
