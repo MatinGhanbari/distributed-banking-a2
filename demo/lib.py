@@ -15,6 +15,8 @@ COORD_ADMIN = os.environ.get("COORD_ADMIN", "http://localhost:8090")
 B, DIM, R, G, Y, C, M, X = ("\033[1m", "\033[2m", "\033[31m", "\033[32m", "\033[33m", "\033[36m",
                             "\033[35m", "\033[0m")
 _checks = []
+SLOW = os.environ.get("SLOW") == "1"            # video mode: short pauses between steps
+SLOW_STEP = float(os.environ.get("SLOW_STEP", "4"))
 _started = datetime.now().astimezone()  # local time WITH offset (docker logs --since)
 
 
@@ -24,8 +26,10 @@ def title(num, name, goal):
     print(f"{DIM}  goal: {goal}{X}")
 
 
-def step(msg):
-    print(f"\n{C}{B}▶ {msg}{X}")
+def step(msg, pause=True):
+    print(f"\n{C}{B}▶ {msg}{X}", flush=True)
+    if SLOW and pause:
+        time.sleep(SLOW_STEP)
 
 
 def info(msg):
@@ -45,7 +49,9 @@ def check(cond, msg):
 def finish(num):
     ok = all(_checks) and _checks
     verdict = f"{G}{B}PASS{X}" if ok else f"{R}{B}FAIL{X}"
-    print(f"\n  {B}Experiment {num}: {verdict}  ({sum(_checks)}/{len(_checks)} checks){X}")
+    print(f"\n  {B}Experiment {num}: {verdict}  ({sum(_checks)}/{len(_checks)} checks){X}", flush=True)
+    if SLOW:
+        time.sleep(SLOW_STEP)
     sys.exit(0 if ok else 1)
 
 

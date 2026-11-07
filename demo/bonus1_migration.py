@@ -49,7 +49,7 @@ def wait_phase(pred, timeout=60):
 
 
 def kill_and_restart(label, pred, show):
-    step(f"Crash {label}")
+    step(f"Crash {label}", pause=False)  # no pause: the migration runs on its own clock
     m = wait_phase(pred)
     compose("kill", "migrator")
     info(f"{R}{B}docker kill migrator{X}  (phase {m[0]}, snapshot next=A{int(m[1]):04d}, cdc lsn={m[2]})")

@@ -3,6 +3,7 @@
 #   demo/run_core.sh            reset + experiments 1-7
 #   demo/run_core.sh --no-reset   use the running deployment
 #   PAUSE=1 demo/run_core.sh      wait for Enter before each experiment (video recording)
+#   SLOW=1 demo/run_core.sh       video pacing: short pauses between steps (~3-4 min)
 cd "$(dirname "$0")"
 B=$'\033[1m'; G=$'\033[32m'; R=$'\033[31m'; C=$'\033[36m'; X=$'\033[0m'
 start=$(date +%s)
@@ -20,7 +21,7 @@ results=()
 for i in "${!files[@]}"; do
   [[ "${PAUSE:-0}" == 1 ]] && read -rp "${C}[Enter] experiment $((i+1)): ${names[$i]}${X}"
   if python3 "${files[$i]}"; then results+=("PASS"); else results+=("FAIL"); fi
-  sleep 1
+  if [[ "${SLOW:-0}" == 1 ]]; then sleep 4; else sleep 1; fi
 done
 echo
 echo "${B}════════════════════ SUMMARY ════════════════════${X}"
