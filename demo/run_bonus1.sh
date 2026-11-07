@@ -6,7 +6,7 @@ cd "$(dirname "$0")"
 C=$'\033[36m'; B=$'\033[1m'; X=$'\033[0m'
 start=$(date +%s)
 if [[ "${SLOW:-0}" == 1 ]]; then   # migrator pacing (read by compose when the migrator is created)
-  export MIG_SNAPSHOT_SLEEP=1.0 MIG_CATCHUP_MIN=25 MIG_FENCE_HOLD=4 MIG_CLEANUP_DELAY=12
+  export SLOW_STEP=6 MIG_SNAPSHOT_SLEEP=1.5 MIG_CATCHUP_MIN=35 MIG_FENCE_HOLD=4 MIG_CLEANUP_DELAY=15
 fi
 if [[ "${1:-}" != "--no-reset" ]]; then
   echo "${C}${B}▶ Fresh deployment (core topology: shards A and B)${X}"

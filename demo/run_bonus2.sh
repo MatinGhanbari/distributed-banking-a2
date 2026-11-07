@@ -4,6 +4,7 @@
 cd "$(dirname "$0")"
 C=$'\033[36m'; B=$'\033[1m'; X=$'\033[0m'
 start=$(date +%s)
+[[ "${SLOW:-0}" == 1 ]] && export SLOW_STEP=8   # video pacing
 if [[ "${1:-}" != "--no-reset" ]]; then
   echo "${C}${B}▶ Fresh deployment (core topology)${X}"
   ./reset.sh || exit 1

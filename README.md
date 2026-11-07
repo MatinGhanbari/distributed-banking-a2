@@ -21,6 +21,7 @@ client.py ──HTTP──► gateway ──(shard map: range → shard, Round R
 | `coordinator` | 2PC coordinator, own container (so it can be stopped alone); admin/status API on host port 8090 |
 | `gateway` | the only client entry point, host port 8080 |
 | `db-c`, `bank-c1/c2`, `migrator` | Bonus I, compose profile `shardc` (started at runtime) |
+| `healer` | Bonus II self-healing controller, compose profile `healing` |
 
 ## Run
 
@@ -189,12 +190,52 @@ boundary transfers B↔migrating), kills the controller in SNAPSHOT, CATCHUP, FE
 ACTIVATED, sends stale requests directly to bank-b1/b2 after activation, and verifies per-account
 balances, global money (A+B+C), placement, 2PC states, slot removal and exactly-once retries.
 
+## Bonus II – self-healing controller
+
+```bash
+demo/run_bonus2.sh             # fresh deployment + healer under load with injected failures (~1 min)
+docker compose --profile healing up -d healer        # manual start
+docker compose logs -f healer
+```
+
+`bank/healer.py` is our own reconciliation loop on the Docker Engine API (Docker SDK, socket
+mounted). No Kubernetes / Swarm / restart policies (every container has `RestartPolicy=no`).
+
+* **Desired state** `meta-db.replica_sets` (shard → desired count, image, shard DB).
+* **Durable intent** `meta-db.replica_slots` (shard, slot) → generation, replica/container name
+  `bank-<shard><slot>-g<generation>`, status `CREATING | STARTING | RUNNING`.
+* **Observed state** containers found by label (`dsbank.role/shard/slot/generation/managed-by`)
+  plus `GET /health` probes (parallel, 1 s).
+* Loop (1 s): container `exited/dead/missing` ⇒ failed now; running/paused but 3 failed probes ⇒
+  unresponsive (`docker pause`, hung process, lost DB). Failure handling, in order:
+  deregister from `replicas` (gateway/coordinator stop routing within 2 s) → **fence** its DB
+  sessions (`pg_terminate_backend` by the live container's IP: a frozen replica can neither keep
+  row locks nor commit later; prepared 2PC txns are not session-bound) → remove container →
+  CAS the slot to generation+1 / `CREATING` → `docker create` (same image/env, unique name,
+  labels, compose network) → start → healthy ⇒ register ⇒ `RUNNING`.
+* **Crash safety**: the intent is persisted before `docker create`, the name is deterministic per
+  (slot, generation) and Docker names are unique ⇒ a restarted controller finds the container
+  (`ADOPT`) instead of creating another. Superseded healer-made containers are removed as
+  orphans. Every step is idempotent. Single controller instance.
+* Healthy replicas are never touched; `desired` changes scale up/down.
+* Extra safety in the DBs: `idle_in_transaction_session_timeout=30s`, TCP keepalives.
+
+The demo runs 8 load clients (deposits, withdrawals, local transfers on A and B, cross-shard 2PC)
+while it: SIGKILLs bank-a1, `docker pause`s bank-b2, makes the controller crash right after
+`docker create` (one-shot flag in `controller_flags`) and restarts it, SIGKILLs the controller
+and a replacement replica while it is down, and scales shard B 2→3→2. It verifies 2 healthy
+registered replicas per shard, no duplicates per slot, bank-b1 untouched, RestartPolicy=no,
+per-account balances, global money and no unresolved 2PC transactions.
+
+## Video mode
+
+`SLOW=1 demo/run_core.sh`, `SLOW=1 demo/run_bonus1.sh`, `SLOW=1 demo/run_bonus2.sh`: pauses
+between steps (`SLOW_STEP`, default 4 s) and slower migrator phases, so each demo takes about
+3–4 minutes. `PAUSE=1` waits for Enter (core: before each experiment; bonus demos: before start).
+
 ## Prepared for the bonuses
 * **Bonus I:** implemented, see above.
-* **Bonus II (self-healing):** replicas are stateless, have `/health`, and the gateway reads the
-  replica registry from `meta-db.replicas` every 2 s, so a controller can start replacement
-  containers via the Docker API and register them without restarting anything. No restart
-  policies are used in compose.
+* **Bonus II:** implemented, see above.
 
 ## Known limitations (core)
 * Single coordinator instance (no coordinator replication / leader election).
@@ -204,6 +245,9 @@ balances, global money (A+B+C), placement, 2PC states, slot removal and exactly-
 * Container logs are in UTC.
 * Bonus I: one migration at a time; the target range must lie inside one source range;
   the controller is a single instance (restarted by the operator / a supervisor after a crash).
+* Bonus II: the healer manages shards listed in `replica_sets` (A, B); it is itself a single
+  instance restarted by the operator; two failures of the same shard within ~2 s can make
+  that shard briefly unavailable (2PC then aborts cleanly).
 
 ## Layout
 ```
@@ -214,7 +258,8 @@ bank/routing.py       shard map cache, health checks, Round Robin, failover
 bank/gateway.py       client-facing API
 bank/coordinator.py   2PC coordinator, durable log, recovery, fault injection
 bank/migrator.py      Bonus I live re-sharding controller
+bank/healer.py        Bonus II self-healing controller
 db/meta_init.sql      meta-db schema + shard map + replica registry
 db/shard_init.sh      shard schema + seed (only the shard's range)
-demo/                 lib.py, exp1..exp7, run_core.sh, reset.sh, bonus1_migration.py, run_bonus1.sh
+demo/                 lib.py, exp1..exp7, run_core.sh, reset.sh, bonus1_migration.py, run_bonus1.sh, bonus2_self_healing.py, run_bonus2.sh
 ```

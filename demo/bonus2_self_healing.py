@@ -61,7 +61,7 @@ def all_policies():
 
 
 def kill_replica(name, how="kill"):
-    time.sleep(3)  # let gateway + coordinator see the previous replacement before the next fault
+    time.sleep(6 if SLOW else 3)  # let gateway + coordinator see the previous replacement first
     docker(how, name)
     info(f"{R}{B}docker {how} {name}{X}")
     return time.time()
