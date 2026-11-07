@@ -1,0 +1,99 @@
+# Distributed Banking Platform - single host.  docker compose up -d --build --wait
+# No restart policies on purpose (Bonus II forbids them; recovery is our own logic).
+name: dsbank
+
+x-pg: &pg
+  image: postgres:16
+  command: ["postgres", "-c", "max_prepared_transactions=100", "-c", "max_connections=200"]
+  healthcheck:
+    # -h 127.0.0.1: the init-time temp server only listens on the unix socket
+    test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U bank"]
+    interval: 2s
+    timeout: 3s
+    retries: 60
+
+x-app: &app
+  # one shared image; it is built once (by bank-a1) and reused by the other services
+  image: ${DOCKERHUB_USER:-matinghanbari}/ds-a2-bank:latest
+  pull_policy: never
+  healthcheck:
+    test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2)"]
+    interval: 2s
+    timeout: 3s
+    retries: 30
+
+x-bank: &bank
+  <<: *app
+  command: ["uvicorn", "bank.shard_server:app", "--host", "0.0.0.0", "--port", "8000", "--no-access-log"]
+
+services:
+  meta-db:            # Shard Map + replica registry + coordinator durable log
+    <<: *pg
+    environment: {POSTGRES_USER: bank, POSTGRES_PASSWORD: bank, POSTGRES_DB: meta}
+    volumes:
+      - meta-data:/var/lib/postgresql/data
+      - ./db/meta_init.sql:/docker-entrypoint-initdb.d/01-meta.sql:ro
+
+  db-a:               # Shard A database: accounts A0001-A1000 only
+    <<: *pg
+    environment: {POSTGRES_USER: bank, POSTGRES_PASSWORD: bank, POSTGRES_DB: bank,
+                  SHARD_ID: A, RANGE_LO: "1", RANGE_HI: "1000"}
+    volumes:
+      - db-a-data:/var/lib/postgresql/data
+      - ./db/shard_init.sh:/docker-entrypoint-initdb.d/01-shard.sh:ro
+
+  db-b:               # Shard B database: accounts A1001-A2000 only
+    <<: *pg
+    environment: {POSTGRES_USER: bank, POSTGRES_PASSWORD: bank, POSTGRES_DB: bank,
+                  SHARD_ID: B, RANGE_LO: "1001", RANGE_HI: "2000"}
+    volumes:
+      - db-b-data:/var/lib/postgresql/data
+      - ./db/shard_init.sh:/docker-entrypoint-initdb.d/01-shard.sh:ro
+
+  bank-a1:
+    <<: *bank
+    build: .
+    pull_policy: build
+    environment: {REPLICA_ID: bank-a1, SHARD_ID: A, DB_DSN: "postgresql://bank:bank@db-a:5432/bank"}
+    depends_on: {db-a: {condition: service_healthy}}
+  bank-a2:
+    <<: *bank
+    environment: {REPLICA_ID: bank-a2, SHARD_ID: A, DB_DSN: "postgresql://bank:bank@db-a:5432/bank"}
+    depends_on: {db-a: {condition: service_healthy}}
+  bank-b1:
+    <<: *bank
+    environment: {REPLICA_ID: bank-b1, SHARD_ID: B, DB_DSN: "postgresql://bank:bank@db-b:5432/bank"}
+    depends_on: {db-b: {condition: service_healthy}}
+  bank-b2:
+    <<: *bank
+    environment: {REPLICA_ID: bank-b2, SHARD_ID: B, DB_DSN: "postgresql://bank:bank@db-b:5432/bank"}
+    depends_on: {db-b: {condition: service_healthy}}
+
+  coordinator:        # 2PC coordinator (own container so it can be stopped alone)
+    <<: *app
+    command: ["uvicorn", "bank.coordinator:app", "--host", "0.0.0.0", "--port", "8000", "--no-access-log"]
+    environment: {META_DSN: "postgresql://bank:bank@meta-db:5432/meta", FAULT_MODE: ""}
+    ports: ["8090:8000"]   # admin/status API (fault injection for experiment 6)
+    depends_on:
+      meta-db: {condition: service_healthy}
+      bank-a1: {condition: service_healthy}
+      bank-b1: {condition: service_healthy}
+
+  gateway:
+    <<: *app
+    command: ["uvicorn", "bank.gateway:app", "--host", "0.0.0.0", "--port", "8000", "--no-access-log"]
+    environment: {META_DSN: "postgresql://bank:bank@meta-db:5432/meta",
+                  COORDINATOR_URL: "http://coordinator:8000"}
+    ports: ["8080:8000"]
+    depends_on:
+      meta-db: {condition: service_healthy}
+      coordinator: {condition: service_healthy}
+      bank-a1: {condition: service_healthy}
+      bank-a2: {condition: service_healthy}
+      bank-b1: {condition: service_healthy}
+      bank-b2: {condition: service_healthy}
+
+volumes:
+  meta-data:
+  db-a-data:
+  db-b-data:
