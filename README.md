@@ -20,6 +20,7 @@ client.py ──HTTP──► gateway ──(shard map: range → shard, Round R
 | `bank-a1/a2`, `bank-b1/b2` | stateless shard replicas sharing their shard DB; also 2PC participants |
 | `coordinator` | 2PC coordinator, own container (so it can be stopped alone); admin/status API on host port 8090 |
 | `gateway` | the only client entry point, host port 8080 |
+| `db-c`, `bank-c1/c2`, `migrator` | Bonus I, compose profile `shardc` (started at runtime) |
 
 ## Run
 
@@ -134,14 +135,62 @@ PostgreSQL defaults (`fsync=on`, `synchronous_commit=on`), named volumes for all
 prepared transactions survive DB restarts. Money is integer cents everywhere (amounts are
 parsed as `Decimal`, never float), as in Assignment 1.
 
+## Bonus I – live re-sharding (A1501–A2000: B → C)
+
+```bash
+demo/run_bonus1.sh             # fresh deployment + live migration under load, 4 controller crashes (~1 min)
+PAUSE=1 demo/run_bonus1.sh     # waits for Enter before the migration starts
+# manual:
+docker compose --profile shardc up -d --wait db-c bank-c1 bank-c2   # new shard at runtime (empty DB)
+docker compose --profile shardc up -d migrator                       # starts / resumes the migration
+docker compose logs -f migrator
+```
+
+`bank/migrator.py` is a crash-consistent state machine persisted in `meta-db.migrations`
+(phase, history, new epoch, checkpoint mirrors, cutover decision). Each phase is idempotent;
+after `docker kill` it is started again and continues from the persisted phase:
+
+| Phase | What happens | Durable position |
+|---|---|---|
+| PLANNED | new epoch = map_epoch+1; register bank-c1/c2 in `replicas`; C ownership row (epoch 2, **writable=false**) | migration row |
+| SPLIT | split A1501–A2000 into its own row in the Shard Map and in B's `ownership`; create logical slot `mig_m1` (`test_decoding`) **before** the snapshot | slot on db-b |
+| SNAPSHOT | copy rows from one `REPEATABLE READ` snapshot in bounded batches (upsert) | `db-c.migration_progress.snapshot_next`, same txn as the rows |
+| CATCHUP | peek committed changes from the slot (commit order), group per transaction, apply account after-images, then `pg_replication_slot_advance` | `migration_progress.cdc_lsn` (commit LSN), same txn as the rows |
+| FENCING | `UPDATE ownership SET writable=false, epoch=2` on B (waits for in-flight writes **and prepared 2PC txns**, which hold `FOR SHARE` on that row); drain CDC to the WAL position after the fence; copy `applied_requests` of the range; verify count + sum + md5 B == C | cutover decision (checksums, epoch, fence LSN) → `CUTOVER_DECIDED` |
+| CUTOVER_DECIDED | C ownership writable=true; **one** meta-db transaction: range → C (epoch 2), `map_epoch=2`, phase `ACTIVATED` | Shard Map |
+| ACTIVATED | verify B range still equals the cutover checksum and C row count; drop slot; delete old rows on B (fenced ownership row kept as tombstone) | `DONE` |
+
+Why it is correct:
+* **CDC**: the slot exists before any snapshot, replay starts at the slot start and is applied in
+  commit order as after-images ⇒ re-copying / re-replaying after a crash (or resuming the
+  snapshot with a *new* snapshot) converges to the source state. Prepared 2PC txns only appear
+  at `COMMIT PREPARED`. The slot keeps WAL on disk; the batch size bounds memory.
+* **Fencing at the shard write path**: every write / PREPARE checks `ownership` inside its txn
+  (`epoch >= ownership.epoch` and `writable`), so stale requests to the old owner are refused
+  even when they bypass the gateway (`421 STALE_EPOCH` / `FENCED`, PREPARE votes NO). B is
+  fenced before C becomes writable ⇒ never two writable owners; between fence and activation
+  the range has **no** writable owner (the brief cutover pause).
+* **Pause handling**: on `421` the gateway refreshes the map and retries (≤ `FENCE_WAIT`, 20 s;
+  nothing was applied). A same-shard transfer that becomes cross-shard is re-decided as 2PC.
+  The coordinator re-routes a participant that answers `STALE_EPOCH/FENCED` (nothing was
+  prepared there) after durably updating the txn's participant list (≤ `REROUTE_WAIT`).
+* **2PC**: in-flight prepared txns block the fence until the coordinator resolves them; COMMIT
+  decisions are never discarded (B keeps `twopc_log`, so a late duplicate COMMIT is still acked).
+* **Exactly-once**: request ids of the range are copied to C; a retry of a request applied on B
+  before the move is replayed as a duplicate on C. PREPARE also rejects a request id that was
+  already applied locally on that shard.
+
+Demo pacing (compose env of `migrator`): `SNAPSHOT_BATCH=20`, `SNAPSHOT_SLEEP=0.25`,
+`CATCHUP_MIN=6`, `FENCE_HOLD=2`, `CLEANUP_DELAY=4` – set to 0 / larger batch for full speed.
+
+`demo/bonus1_migration.py` runs 6 load clients during the whole migration (deposits,
+withdrawals, local transfers on migrating accounts, cross-shard A↔migrating, B-only accounts,
+boundary transfers B↔migrating), kills the controller in SNAPSHOT, CATCHUP, FENCING and
+ACTIVATED, sends stale requests directly to bank-b1/b2 after activation, and verifies per-account
+balances, global money (A+B+C), placement, 2PC states, slot removal and exactly-once retries.
+
 ## Prepared for the bonuses
-* **Bonus I (live re-sharding):** persistent Shard Map with per-range and global epoch;
-  epoch + `writable` fence checked **inside every shard write transaction** (`ownership …
-  FOR SHARE`, so a fencing `UPDATE` waits for in-flight writes and prepared 2PC txns on that
-  range); stale/fenced requests get `421` and the gateway refreshes its map and retries;
-  client request ids + idempotent ops + txn status query; append-only `ledger` table with an
-  ordered `seq` as the change-capture source; meta-db is the place for the persisted
-  migration state machine.
+* **Bonus I:** implemented, see above.
 * **Bonus II (self-healing):** replicas are stateless, have `/health`, and the gateway reads the
   replica registry from `meta-db.replicas` every 2 s, so a controller can start replacement
   containers via the Docker API and register them without restarting anything. No restart
@@ -153,6 +202,8 @@ parsed as `Decimal`, never float), as in Assignment 1.
 * While a participant stays prepared (e.g. coordinator down), its row stays locked; other
   writes to that account wait (`lock_timeout` 5 s in 2PC) – inherent to blocking 2PC.
 * Container logs are in UTC.
+* Bonus I: one migration at a time; the target range must lie inside one source range;
+  the controller is a single instance (restarted by the operator / a supervisor after a crash).
 
 ## Layout
 ```
@@ -162,7 +213,8 @@ bank/shard_server.py  shard replica + 2PC participant
 bank/routing.py       shard map cache, health checks, Round Robin, failover
 bank/gateway.py       client-facing API
 bank/coordinator.py   2PC coordinator, durable log, recovery, fault injection
+bank/migrator.py      Bonus I live re-sharding controller
 db/meta_init.sql      meta-db schema + shard map + replica registry
 db/shard_init.sh      shard schema + seed (only the shard's range)
-demo/                 lib.py, exp1..exp7, run_core.sh, reset.sh
+demo/                 lib.py, exp1..exp7, run_core.sh, reset.sh, bonus1_migration.py, run_bonus1.sh
 ```
