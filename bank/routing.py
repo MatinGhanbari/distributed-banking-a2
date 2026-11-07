@@ -131,9 +131,14 @@ class Router:
                 raise BankError("SHARD_UNAVAILABLE", 503, f"no healthy replica for shard {shard}")
             tried.add(r.id)
             try:
-                return r, self.http.request(method, r.url + path, **kw)
+                resp = self.http.request(method, r.url + path, **kw)
+                resp.json()  # a non-JSON answer did not come from a bank replica
+                return r, resp
             except httpx.TransportError as e:
                 self.mark_down(r, type(e).__name__)
+            except ValueError:
+                # e.g. a stopped container's name resolved by an upstream DNS/proxy
+                self.mark_down(r, f"non-JSON HTTP {resp.status_code}")
 
     def snapshot(self):
         with self.lock:

@@ -103,13 +103,13 @@ def transfer(body: dict = Body(...)):
         return forward("transfer", p["from"], "POST", "/transfer_local", p)
     try:
         resp = coord.post(COORDINATOR + "/transfer", json=p)
-    except httpx.TransportError as e:
+        b = resp.json()
+    except (httpx.TransportError, ValueError) as e:  # ValueError: answer not from the coordinator
         log.info("ROUTE op=transfer %s->%s kind=2pc coordinator UNREACHABLE (%s) rid=%s",
                  p["from"], p["to"], type(e).__name__, p["request_id"])
         return JSONResponse(status_code=502, content={
             "ok": False, "status": "UNKNOWN", "request_id": p["request_id"], "routing": "2pc",
             "message": "coordinator unreachable, outcome unknown; query /txn/by-request/<request_id>"})
-    b = resp.json()
     log.info("ROUTE op=transfer %s(shard %s)->%s(shard %s) kind=2pc txn=%s -> %s", p["from"], s1, p["to"], s2,
              (b.get("txn_id") or "")[:8], b.get("status") or b.get("error"))
     b["routing"] = "2pc"
@@ -119,10 +119,10 @@ def transfer(body: dict = Body(...)):
 def coord_get(path):
     try:
         resp = coord.get(COORDINATOR + path, timeout=5)
-    except httpx.TransportError:
+        return JSONResponse(status_code=resp.status_code, content=resp.json())
+    except (httpx.TransportError, ValueError):
         return JSONResponse(status_code=503, content={
             "ok": False, "status": "UNKNOWN", "message": "coordinator unreachable; outcome not known yet"})
-    return JSONResponse(status_code=resp.status_code, content=resp.json())
 
 
 @app.get("/txn/by-request/{request_id}")
