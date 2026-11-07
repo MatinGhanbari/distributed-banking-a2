@@ -5,7 +5,9 @@ name: dsbank
 x-pg: &pg
   image: postgres:16
   command: ["postgres", "-c", "max_prepared_transactions=100", "-c", "max_connections=200",
-            "-c", "wal_level=logical", "-c", "max_replication_slots=10"]   # logical: CDC for re-sharding
+            "-c", "wal_level=logical", "-c", "max_replication_slots=10",    # logical: CDC for re-sharding
+            "-c", "idle_in_transaction_session_timeout=30s",                # safety net: frozen clients
+            "-c", "tcp_keepalives_idle=5", "-c", "tcp_keepalives_interval=2", "-c", "tcp_keepalives_count=3"]
   healthcheck:
     # -h 127.0.0.1: the init-time temp server only listens on the unix socket
     test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U bank"]
@@ -53,20 +55,24 @@ services:
 
   bank-a1:
     <<: *bank
+    labels: {dsbank.role: bank-replica, dsbank.shard: A, dsbank.slot: "1", dsbank.generation: "1", dsbank.managed-by: compose}
     build: .
     pull_policy: build
     environment: {REPLICA_ID: bank-a1, SHARD_ID: A, DB_DSN: "postgresql://bank:bank@db-a:5432/bank"}
     depends_on: {db-a: {condition: service_healthy}}
   bank-a2:
     <<: *bank
+    labels: {dsbank.role: bank-replica, dsbank.shard: A, dsbank.slot: "2", dsbank.generation: "1", dsbank.managed-by: compose}
     environment: {REPLICA_ID: bank-a2, SHARD_ID: A, DB_DSN: "postgresql://bank:bank@db-a:5432/bank"}
     depends_on: {db-a: {condition: service_healthy}}
   bank-b1:
     <<: *bank
+    labels: {dsbank.role: bank-replica, dsbank.shard: B, dsbank.slot: "1", dsbank.generation: "1", dsbank.managed-by: compose}
     environment: {REPLICA_ID: bank-b1, SHARD_ID: B, DB_DSN: "postgresql://bank:bank@db-b:5432/bank"}
     depends_on: {db-b: {condition: service_healthy}}
   bank-b2:
     <<: *bank
+    labels: {dsbank.role: bank-replica, dsbank.shard: B, dsbank.slot: "2", dsbank.generation: "1", dsbank.managed-by: compose}
     environment: {REPLICA_ID: bank-b2, SHARD_ID: B, DB_DSN: "postgresql://bank:bank@db-b:5432/bank"}
     depends_on: {db-b: {condition: service_healthy}}
 
@@ -81,11 +87,13 @@ services:
       - ./db/shard_init.sh:/docker-entrypoint-initdb.d/01-shard.sh:ro
   bank-c1:
     <<: *bank
+    labels: {dsbank.role: bank-replica, dsbank.shard: C, dsbank.slot: "1", dsbank.generation: "1", dsbank.managed-by: compose}
     profiles: [shardc]
     environment: {REPLICA_ID: bank-c1, SHARD_ID: C, DB_DSN: "postgresql://bank:bank@db-c:5432/bank"}
     depends_on: {db-c: {condition: service_healthy}}
   bank-c2:
     <<: *bank
+    labels: {dsbank.role: bank-replica, dsbank.shard: C, dsbank.slot: "2", dsbank.generation: "1", dsbank.managed-by: compose}
     profiles: [shardc]
     environment: {REPLICA_ID: bank-c2, SHARD_ID: C, DB_DSN: "postgresql://bank:bank@db-c:5432/bank"}
     depends_on: {db-c: {condition: service_healthy}}
@@ -106,14 +114,30 @@ services:
       TARGET_REPLICAS: "bank-c1=http://bank-c1:8000,bank-c2=http://bank-c2:8000"
       # demo pacing (so each phase is visible and can be killed); 0 for full speed
       SNAPSHOT_BATCH: "20"
-      SNAPSHOT_SLEEP: "0.25"
-      CATCHUP_MIN: "6"
-      FENCE_HOLD: "2"
-      CLEANUP_DELAY: "4"
+      SNAPSHOT_SLEEP: "${MIG_SNAPSHOT_SLEEP:-0.25}"
+      CATCHUP_MIN: "${MIG_CATCHUP_MIN:-6}"
+      FENCE_HOLD: "${MIG_FENCE_HOLD:-2}"
+      CLEANUP_DELAY: "${MIG_CLEANUP_DELAY:-4}"
     depends_on:
       meta-db: {condition: service_healthy}
       db-b: {condition: service_healthy}
       db-c: {condition: service_healthy}
+
+  # ---------------- Bonus II: self-healing controller:  docker compose --profile healing up -d healer
+  healer:
+    <<: *app
+    profiles: [healing]
+    command: ["python", "-m", "bank.healer"]
+    healthcheck: {disable: true}
+    volumes: ["/var/run/docker.sock:/var/run/docker.sock"]   # Docker Engine API (no restart policies used)
+    environment:
+      META_DSN: "postgresql://bank:bank@meta-db:5432/meta"
+      HEAL_NETWORK: dsbank_default
+      PROBE_INTERVAL: "1"
+      FAIL_THRESHOLD: "3"        # consecutive failed /health probes => unresponsive (paused / hung)
+      START_TIMEOUT: "40"
+    depends_on:
+      meta-db: {condition: service_healthy}
 
   coordinator:        # 2PC coordinator (own container so it can be stopped alone)
     <<: *app

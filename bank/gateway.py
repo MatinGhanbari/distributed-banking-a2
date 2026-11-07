@@ -18,7 +18,7 @@ from .common import BankError, acct_num, fmt, parse_amount, setup_logging
 from .routing import Router
 
 log = setup_logging("gateway")
-router = Router(os.environ["META_DSN"], log)
+router = Router(os.environ["META_DSN"], log, request_timeout=8.0)
 COORDINATOR = os.environ.get("COORDINATOR_URL", "http://coordinator:8000")
 coord = httpx.Client(timeout=httpx.Timeout(30.0, connect=2.0))
 # How long a request may wait while its range is fenced for a re-sharding cutover.

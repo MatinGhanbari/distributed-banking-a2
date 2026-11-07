@@ -124,9 +124,19 @@ class Router:
 
     def call(self, shard, method, path, **kw):
         """Send to one healthy replica of `shard`; fail over to the next on transport errors."""
-        tried = set()
+        tried, rescanned = set(), False
         while True:
             r = self.pick(shard, tried)
+            if r is None and not rescanned:
+                # e.g. a replacement replica was just registered (Bonus II): re-read the registry
+                # and probe now instead of waiting for the next background cycle
+                rescanned = True
+                try:
+                    self.refresh()
+                    self.check_all()
+                except Exception:
+                    pass
+                r = self.pick(shard, tried)
             if r is None:
                 raise BankError("SHARD_UNAVAILABLE", 503, f"no healthy replica for shard {shard}")
             tried.add(r.id)
