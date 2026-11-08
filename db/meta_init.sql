@@ -106,8 +106,8 @@ INSERT INTO replicas VALUES
     ('bank-b2', 'B', 'http://bank-b2:8000', true);
 
 INSERT INTO replica_sets VALUES
-    ('A', 2, 'matinghanbari/ds-a2-bank:latest', 'postgresql://bank:bank@db-a:5432/bank'),
-    ('B', 2, 'matinghanbari/ds-a2-bank:latest', 'postgresql://bank:bank@db-b:5432/bank');
+    ('A', 2, '132461342342351345234/ds-a2-bank:latest', 'postgresql://bank:bank@db-a:5432/bank'),
+    ('B', 2, '132461342342351345234/ds-a2-bank:latest', 'postgresql://bank:bank@db-b:5432/bank');
 INSERT INTO replica_slots (shard_id, slot, generation, replica_id, container, status) VALUES
     ('A', 1, 1, 'bank-a1', 'dsbank-bank-a1-1', 'RUNNING'),
     ('A', 2, 1, 'bank-a2', 'dsbank-bank-a2-1', 'RUNNING'),

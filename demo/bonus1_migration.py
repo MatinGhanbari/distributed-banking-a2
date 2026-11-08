@@ -164,6 +164,18 @@ check(fence_state["b"][2] == "f" and fence_state["c"][2] == "f",
 stale = {}
 
 
+def _settled_prepared():
+    # pg_prepared_xacts also lists legitimate in-flight 2PCs of the ongoing load (A120x etc.),
+    # so wait until they finish: a stale prepare (vote NO) never leaves one behind.
+    n = "0"
+    for _ in range(40):
+        n = sql1("db-b", "SELECT count(*) FROM pg_prepared_xacts")
+        if n == "0":
+            break
+        time.sleep(0.25)
+    return n
+
+
 def stale_attack():
     cut = json.loads(sql1("meta-db", "SELECT cutover FROM migrations WHERE id = 'm1'"))
     info(f"cutover decision (meta-db): {cut['count']} accounts, sum {fmt(cut['sum_cents'])}, md5 {cut['md5'][:12]}, "
@@ -191,7 +203,7 @@ def stale_attack():
     md5_after = sql1("db-b", "SELECT md5(coalesce(string_agg(id || ':' || balance_cents || ':' || frozen, ',' ORDER BY id), '')) FROM accounts WHERE num BETWEEN 1501 AND 2000")
     stale.update(rejected=rejected, unchanged=md5_before == md5_after == cut["md5"],
                  ledger=sql1("db-b", "SELECT coalesce(max(seq), 0) FROM ledger WHERE account_id BETWEEN 'A1501' AND 'A2000' AND seq > %s" % ledger_before),
-                 prepared=sql1("db-b", "SELECT count(*) FROM pg_prepared_xacts"))
+                 prepared=_settled_prepared())
     info(f"old rows on db-b: md5 {md5_after[:12]} (cutover {cut['md5'][:12]})   new ledger entries for the range: {stale['ledger']}")
 
 

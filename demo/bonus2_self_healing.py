@@ -55,7 +55,9 @@ def restart_policies():
 
 
 def all_policies():
-    ids = docker("ps", "-aq").split()
+    # only this project's containers (Docker Desktop may run unrelated ones with their own policies)
+    ids = sorted(set(docker("ps", "-aq", "--filter", "label=com.docker.compose.project=dsbank").split()
+                     + docker("ps", "-aq", "--filter", "label=dsbank.managed-by=healer").split()))
     out = docker("inspect", "-f", "{{.Name}} {{.HostConfig.RestartPolicy.Name}}", *ids)
     return dict(l.lstrip("/").split() for l in out.splitlines())
 
@@ -207,7 +209,7 @@ pol = all_policies()
 b1_after = docker("inspect", "-f", "{{.Id}} {{.State.StartedAt}}", "dsbank-bank-b1-1")
 
 step("Load results")
-for r in results:  # resolve uncertain outcomes (retry with the same request id / status query)
+def _resolve(r):  # resolve uncertain outcomes (retry with the same request id / status query)
     b = r["b"]
     if r["kind"] == "transfer" and b.get("routing") == "2pc":
         s = b.get("status") or ("ERROR:" + str(b.get("error")))
@@ -222,6 +224,17 @@ for r in results:  # resolve uncertain outcomes (retry with the same request id 
                                client.transfer(r["src"], r["dst"], fmt(r["cents"]), b["request_id"]))
         r["ok"] = r["st"] == 200
         r["final"] = "OK" if r["ok"] else r["b"].get("error")
+
+
+_unsure = [r for r in results if (r["kind"] == "transfer" and r["b"].get("routing") == "2pc"
+           and (r["b"].get("status") or "ERROR") in ("PENDING", "UNKNOWN"))
+           or not (r["kind"] == "transfer" and r["b"].get("routing") == "2pc") and r["st"] not in (200, 409, 404)]
+info(f"{len(results)} requests sent, resolving {len(_unsure)} uncertain outcomes (same request id / status query)...")
+from concurrent.futures import ThreadPoolExecutor as _TPE
+with _TPE(16) as _ex:
+    for _i, _ in enumerate(_ex.map(_resolve, results), 1):
+        if _i % 2000 == 0:
+            info(f"  resolved {_i}/{len(results)}")
 kinds = Counter((r["kind"] if r["kind"] != "transfer" else "transfer/" + (r["b"].get("routing") or "?"), r["final"])
                 for r in results)
 info("outcomes: " + ", ".join(f"{k[0]} {k[1]}={n}" for k, n in sorted(kinds.items())))
